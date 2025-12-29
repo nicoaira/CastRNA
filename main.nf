@@ -57,6 +57,10 @@ def helpMessage() {
       --noncanonical_pairs  How to handle non-canonical base pairs:
                             'keep' (default), 'remove', or 'flag'
 
+    MSA output:
+      --output_msa          Generate multi-sequence alignments grouped by Rfam family
+                            Outputs Stockholm (.sto) and aligned FASTA (.afa) per family
+
     Examples:
       # Inference mode (all sequences scanned against Rfam)
       nextflow run main.nf --input sequences.fasta
@@ -69,6 +73,9 @@ def helpMessage() {
 
       # Reproduce bpRNA results using seed alignments
       nextflow run main.nf --input sequences.fasta --alignment_method seed --rfam_release 12.2
+
+      # Generate MSA outputs grouped by Rfam family
+      nextflow run main.nf --input sequences.fasta --mapping mapping.csv --output_msa
 
     """.stripIndent()
 }
@@ -97,6 +104,7 @@ Mapping     : ${params.mapping ?: 'none (inference mode)'}
 Output dir  : ${params.outdir}
 Rfam release: ${params.rfam_release ?: 'CURRENT'}
 Alignment   : ${params.alignment_method ?: 'cmalign'}
+Output MSA  : ${params.output_msa}
 cmscan E    : ${params.cmscan_evalue}
 cmscan T    : ${params.cmscan_score}
 -----------------------------------------
@@ -114,6 +122,8 @@ include { INFERNAL_CMALIGN     } from './modules/local/infernal_cmalign/main'
 include { SEED_ALIGNMENT       } from './modules/local/seed_alignment/main'
 include { CONSENSUS_PROJECTION } from './modules/local/consensus_projection/main'
 include { GENERATE_SUMMARY     } from './modules/local/generate_summary/main'
+include { CMALIGN_GROUP        } from './modules/local/cmalign_group/main'
+include { GENERATE_MSA         } from './modules/local/generate_msa/main'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -294,6 +304,30 @@ workflow {
     ch_branched.known
         .mix(ch_cmscan_parsed.pass)
         .set { ch_for_alignment }
+
+    //
+    // STEP 6b: Generate MSA outputs (if --output_msa is enabled)
+    //
+    if (params.output_msa) {
+        // Group sequences by Rfam family
+        ch_for_alignment
+            .map { meta, fasta -> [meta.rfam_id, fasta] }
+            .groupTuple()
+            .set { ch_grouped_by_family }
+
+        // Run cmalign on grouped sequences to get proper MSA
+        CMALIGN_GROUP(
+            ch_grouped_by_family,
+            PREPARE_RFAM.out.cm_index.collect()
+        )
+        ch_versions = ch_versions.mix(CMALIGN_GROUP.out.versions.first().ifEmpty([]))
+
+        // Generate MSA outputs (Stockholm with SS, aligned FASTA, TSV)
+        GENERATE_MSA(
+            CMALIGN_GROUP.out.stockholm
+        )
+        ch_versions = ch_versions.mix(GENERATE_MSA.out.versions.first().ifEmpty([]))
+    }
 
     //
     // STEP 7: Run alignment (cmalign or seed-based depending on method)
