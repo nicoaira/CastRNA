@@ -124,6 +124,7 @@ include { CONSENSUS_PROJECTION } from './modules/local/consensus_projection/main
 include { GENERATE_SUMMARY     } from './modules/local/generate_summary/main'
 include { CMALIGN_GROUP        } from './modules/local/cmalign_group/main'
 include { GENERATE_MSA         } from './modules/local/generate_msa/main'
+include { VALIDATE_RFAM_IDS    } from './modules/local/validate_rfam_ids/main'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -238,6 +239,56 @@ workflow {
         .set { ch_branched }
 
     //
+    // STEP 3b: Validate known Rfam IDs against the database
+    //
+    // Extract unique Rfam IDs from known sequences
+    ch_unique_rfam_ids = ch_branched.known
+        .map { meta, fasta -> meta.rfam_id }
+        .unique()
+        .collect()
+
+    // Validate Rfam IDs against the CM database
+    VALIDATE_RFAM_IDS(
+        ch_unique_rfam_ids,
+        PREPARE_RFAM.out.cm_index.collect()
+    )
+    ch_versions = ch_versions.mix(VALIDATE_RFAM_IDS.out.versions)
+
+    // Read valid IDs into a channel
+    ch_valid_rfam_ids = VALIDATE_RFAM_IDS.out.valid_ids
+        .splitText()
+        .map { it.trim() }
+        .filter { it }
+        .collect()
+        .map { it.toSet() }
+
+    // Log invalid Rfam IDs
+    VALIDATE_RFAM_IDS.out.invalid_ids
+        .splitText()
+        .map { it.trim() }
+        .filter { it }
+        .subscribe { rfam_id ->
+            log.warn "Rfam family ${rfam_id} not found in database - sequences with this family will be skipped"
+        }
+
+    // Filter known sequences to only include those with valid Rfam IDs
+    ch_known_validated = ch_branched.known
+        .combine(ch_valid_rfam_ids)
+        .branch {
+            meta, fasta, valid_ids ->
+                valid: valid_ids.contains(meta.rfam_id)
+                    return [meta, fasta]
+                invalid: true
+                    return [meta, fasta]
+        }
+
+    // Log sequences being skipped due to invalid Rfam IDs
+    ch_known_validated.invalid
+        .subscribe { meta, fasta ->
+            log.warn "Skipping ${meta.id} - Rfam family ${meta.rfam_id} not found in database"
+        }
+
+    //
     // STEP 4: Run cmscan on unknown sequences
     //
     INFERNAL_CMSCAN(
@@ -299,9 +350,9 @@ workflow {
         }
 
     //
-    // STEP 6: Combine known and inferred sequences for alignment
+    // STEP 6: Combine validated known and inferred sequences for alignment
     //
-    ch_branched.known
+    ch_known_validated.valid
         .mix(ch_cmscan_parsed.pass)
         .set { ch_for_alignment }
 
